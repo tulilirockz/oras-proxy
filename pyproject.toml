@@ -1,0 +1,15 @@
+[project]
+name = "chungusimages"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi[standard-no-fastapi-cloud-cli]>=0.139.0",
+    "typer>=0.26.8",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.9",
+]
