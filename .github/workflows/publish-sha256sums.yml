@@ -1,0 +1,346 @@
+name: Publish SHA256SUMS
+
+# Builds the systemd-sysupdate SHA256SUMS manifest for OCI artifacts and stores
+# it as an OCI artifact in GHCR.  
+#
+# Typical use, from an image build workflow:
+#
+#   jobs:
+#     publish-shasums:
+#       needs: build
+#       uses: <you :3>/oras-proxy/.github/workflows/publish-sha256sums.yml@main
+#       with:
+#         repositories: |
+#           ghcr.io/zirconium-dev/zirconium/snapd
+#           ghcr.io/zirconium-dev/zirconium/usr
+#           ghcr.io/zirconium-dev/zirconium/usr-verity
+#           ghcr.io/zirconium-dev/zirconium/usr-verity-sig
+#           ghcr.io/zirconium-dev/zirconium/uki
+#       permissions:
+#         contents: read
+#         packages: write
+
+on:
+  workflow_call:
+    inputs:
+      repositories:
+        description: "Newline-separated OCI repositories to scan (one per line, # comments allowed)"
+        required: true
+        type: string
+      shasums-image:
+        description: "OCI artifact reference for SHA256SUMS (default: ghcr.io/<caller-repo>/sha256sums:latest)"
+        required: false
+        type: string
+        default: ""
+      mode:
+        description: "'incremental' merges into the existing manifest; 'full' regenerates it from scratch"
+        required: false
+        type: string
+        default: incremental
+      tag-regex:
+        description: "Only scan tags matching this regular expression"
+        required: false
+        type: string
+        default: ".*"
+      exclude-tag-regex:
+        description: "Skip tags matching this regular expression"
+        required: false
+        type: string
+        default: '^(?:sha256-.*|.*\.sig)$'
+      filename-regex:
+        description: "Only include layers whose OCI title matches this regular expression"
+        required: false
+        type: string
+        default: '\.(?:raw|efi|tar)(?:\.(?:zst|xz|gz))?$'
+      check-names:
+        description: "Warn when filenames do not follow the name/tag convention below"
+        required: false
+        type: boolean
+        default: true
+      name-pattern:
+        description: "Pattern used by check-names to parse filenames"
+        required: false
+        type: string
+        default: '^(?P<component>.+)-(?P<arch>[^-]+)_(?P<version>.+?)\.raw(?:\.(?P<compression>[a-z0-9]+))?$'
+      tag-template:
+        description: "Expected tag for a parsed filename (used by check-names)"
+        required: false
+        type: string
+        default: "{version}-{arch}"
+      repository-base:
+        description: "Expected repository prefix for check-names, e.g. ghcr.io/org/image"
+        required: false
+        type: string
+        default: ""
+      prune:
+        description: "Remove entries for scanned repositories that no longer exist (requires a previous mapping)"
+        required: false
+        type: boolean
+        default: false
+      strict:
+        description: "Fail if any repository, tag, or filename cannot be processed"
+        required: false
+        type: boolean
+        default: false
+      parallelism:
+        description: "Number of manifests to fetch concurrently"
+        required: false
+        type: number
+        default: 8
+    outputs:
+      artifact:
+        description: "The OCI artifact reference that was published"
+        value: ${{ jobs.publish.outputs.artifact }}
+      digest:
+        description: "The manifest digest of the published artifact"
+        value: ${{ jobs.publish.outputs.digest }}
+
+  workflow_dispatch:
+    inputs:
+      repositories:
+        description: "Newline-separated OCI repositories to scan"
+        required: true
+        type: string
+      shasums-image:
+        description: "OCI artifact reference (default: ghcr.io/<this-repo>/sha256sums:latest)"
+        required: false
+        type: string
+        default: ""
+      mode:
+        description: "incremental or full"
+        required: false
+        type: choice
+        options:
+          - incremental
+          - full
+        default: incremental
+      tag-regex:
+        description: "Only scan tags matching this regular expression"
+        required: false
+        type: string
+        default: ".*"
+      exclude-tag-regex:
+        description: "Skip tags matching this regular expression"
+        required: false
+        type: string
+        default: '^(?:sha256-.*|.*\.sig)$'
+      filename-regex:
+        description: "Only include layers whose OCI title matches this regular expression"
+        required: false
+        type: string
+        default: '\.(?:raw|efi|tar)(?:\.(?:zst|xz|gz))?$'
+      check-names:
+        description: "Warn when filenames do not follow the name/tag convention"
+        required: false
+        type: boolean
+        default: true
+      name-pattern:
+        description: "Pattern used by check-names to parse filenames"
+        required: false
+        type: string
+        default: '^(?P<component>.+)-(?P<arch>[^-]+)_(?P<version>.+?)\.raw(?:\.(?P<compression>[a-z0-9]+))?$'
+      tag-template:
+        description: "Expected tag for a parsed filename (used by check-names)"
+        required: false
+        type: string
+        default: "{version}-{arch}"
+      repository-base:
+        description: "Expected repository prefix for check-names"
+        required: false
+        type: string
+        default: ""
+      prune:
+        description: "Remove entries for scanned repositories that no longer exist"
+        required: false
+        type: boolean
+        default: false
+      strict:
+        description: "Fail if any repository, tag, or filename cannot be processed"
+        required: false
+        type: boolean
+        default: false
+      parallelism:
+        description: "Number of manifests to fetch concurrently"
+        required: false
+        type: number
+        default: 8
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: sha256sums-${{ inputs.shasums-image || github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Generate and publish SHA256SUMS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact: ${{ steps.push.outputs.artifact }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Resolve tool repository
+        id: tool
+        env:
+          JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          ref="${JOB_WORKFLOW_REF:-$WORKFLOW_REF}"
+          repo_and_path="${ref%@*}"
+          sha="${ref##*@}"
+          repo="${repo_and_path%%/.github/workflows/*}"
+          if [[ -z "$repo" || "$repo" == "$repo_and_path" || -z "$sha" ]]; then
+            echo "Could not parse workflow ref: $ref" >&2
+            exit 1
+          fi
+          echo "repository=$repo" >> "$GITHUB_OUTPUT"
+          echo "ref=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out helper scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ steps.tool.outputs.repository }}
+          ref: ${{ steps.tool.outputs.ref }}
+          path: .sha256sums-tool
+          persist-credentials: false
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Install oras
+        uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          printf '%s' "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Resolve artifact reference
+        id: artifact
+        env:
+          INPUT_IMAGE: ${{ inputs.shasums-image }}
+        run: |
+          set -euo pipefail
+          image="${INPUT_IMAGE:-ghcr.io/${GITHUB_REPOSITORY}/sha256sums:latest}"
+          if [[ "${image##*/}" != *:* ]]; then
+            image="${image}:latest"
+          fi
+          repository="${image%:*}"
+          tag="${image##*:}"
+          repository="$(tr '[:upper:]' '[:lower:]' <<< "$repository")"
+          echo "image=${repository}:${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Check workflow mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" != "incremental" && "$MODE" != "full" ]]; then
+            echo "mode must be 'incremental' or 'full', got '$MODE'" >&2
+            exit 1
+          fi
+
+      - name: Fetch previous SHA256SUMS
+        if: inputs.mode == 'incremental'
+        env:
+          SHASUMS_IMAGE: ${{ steps.artifact.outputs.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shasums-existing" "$RUNNER_TEMP/shasums-out"
+          if oras pull "$SHASUMS_IMAGE" -o "$RUNNER_TEMP/shasums-existing" --no-tty; then
+            echo "Merging into the existing manifest."
+          else
+            echo "No existing SHA256SUMS artifact at $SHASUMS_IMAGE; starting from scratch."
+            rm -rf "$RUNNER_TEMP/shasums-existing"
+            mkdir -p "$RUNNER_TEMP/shasums-existing"
+          fi
+
+      - name: Prepare output directory
+        if: inputs.mode == 'full'
+        run: mkdir -p "$RUNNER_TEMP/shasums-existing" "$RUNNER_TEMP/shasums-out"
+
+      - name: Generate SHA256SUMS
+        env:
+          REPOSITORIES: ${{ inputs.repositories }}
+          TAG_REGEX: ${{ inputs.tag-regex }}
+          EXCLUDE_TAG_REGEX: ${{ inputs.exclude-tag-regex }}
+          FILENAME_REGEX: ${{ inputs.filename-regex }}
+          NAME_PATTERN: ${{ inputs.name-pattern }}
+          TAG_TEMPLATE: ${{ inputs.tag-template }}
+          REPOSITORY_BASE: ${{ inputs.repository-base }}
+          MODE: ${{ inputs.mode }}
+          CHECK_NAMES: ${{ inputs.check-names }}
+          PRUNE: ${{ inputs.prune }}
+          STRICT: ${{ inputs.strict }}
+          PARALLELISM: ${{ inputs.parallelism }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$REPOSITORIES" > "$RUNNER_TEMP/repositories.txt"
+
+          args=(
+            --repositories-file "$RUNNER_TEMP/repositories.txt"
+            --existing "$RUNNER_TEMP/shasums-existing/SHA256SUMS"
+            --existing-mapping "$RUNNER_TEMP/shasums-existing/SHA256SUMS.json"
+            --output "$RUNNER_TEMP/shasums-out/SHA256SUMS"
+            --mapping-output "$RUNNER_TEMP/shasums-out/SHA256SUMS.json"
+            --tag-regex "$TAG_REGEX"
+            --exclude-tag-regex "$EXCLUDE_TAG_REGEX"
+            --filename-regex "$FILENAME_REGEX"
+            --name-pattern "$NAME_PATTERN"
+            --tag-template "$TAG_TEMPLATE"
+            --parallelism "$PARALLELISM"
+          )
+          [[ -n "$REPOSITORY_BASE" ]] && args+=(--repository-base "$REPOSITORY_BASE")
+          [[ "$CHECK_NAMES" == "true" ]] && args+=(--check-names)
+          [[ "$STRICT" == "true" ]] && args+=(--strict)
+          # In full mode every entry is regenerated, so there is nothing to prune.
+          [[ "$PRUNE" == "true" && "$MODE" == "incremental" ]] && args+=(--prune)
+
+          python3 .sha256sums-tool/scripts/sha256sums.py "${args[@]}" \
+            | tee "$RUNNER_TEMP/summary.txt"
+
+      - name: Push SHA256SUMS
+        id: push
+        env:
+          SHASUMS_IMAGE: ${{ steps.artifact.outputs.image }}
+        run: |
+          set -euo pipefail
+          oras push "$SHASUMS_IMAGE" \
+            --artifact-type "application/vnd.zirconium.sha256sums.v1" \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "org.opencontainers.image.title=SHA256SUMS" \
+            "$RUNNER_TEMP/shasums-out/SHA256SUMS:text/plain" \
+            "$RUNNER_TEMP/shasums-out/SHA256SUMS.json:application/json"
+
+          digest="$(crane digest "$SHASUMS_IMAGE")"
+          echo "artifact=$SHASUMS_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Write job summary
+        if: always()
+        env:
+          SHASUMS_IMAGE: ${{ steps.artifact.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "## SHA256SUMS"
+            echo
+            if [[ -f "$RUNNER_TEMP/summary.txt" ]]; then
+              echo '```'
+              cat "$RUNNER_TEMP/summary.txt"
+              echo '```'
+            fi
+            if [[ -n "${SHASUMS_IMAGE:-}" ]]; then
+              echo "- Artifact: \`${SHASUMS_IMAGE}\`"
+            fi
+            if [[ -n "${DIGEST:-}" ]]; then
+              echo "- Digest: \`${DIGEST}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
